@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ from typing import Mapping, Sequence
 
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+ATTACK_CHAIN_WINDOW_SECONDS = 15 * 60
 ENCRYPTED_EXTENSIONS = {".encrypted", ".locked", ".crypt", ".enc"}
 RANSOM_NOTE_NAMES = {"readme_restore.txt", "recover_files.txt", "how_to_decrypt.txt"}
 SUSPICIOUS_LSASS_ACCESS = {"0x1010", "0x1410", "0x143a", "0x1fffff"}
@@ -233,9 +236,10 @@ def analyze(events: Sequence[Event]) -> Incident:
     techniques = tuple(sorted({finding.technique_id for finding in ordered}))
     hosts = tuple(sorted({finding.host for finding in ordered}))
     rules = {finding.rule_id for finding in ordered}
-    if "RANSOM-006" in rules and len(techniques) >= 4:
+    correlated_chain = _has_correlated_attack_chain(ordered)
+    if correlated_chain == "critical":
         severity = "critical"
-    elif len(techniques) >= 3:
+    elif correlated_chain == "high":
         severity = "high"
     elif findings:
         severity = "medium"
@@ -243,6 +247,59 @@ def analyze(events: Sequence[Event]) -> Incident:
         severity = "informational"
     confidence = "high" if len(rules) >= 5 else "medium" if len(rules) >= 2 else "low"
     return Incident(severity, confidence, ordered, hosts, techniques)
+
+
+def _has_correlated_attack_chain(findings: Sequence[Detection]) -> str | None:
+    """Return severity for a multi-technique chain on one host within 15 minutes."""
+    by_host: dict[str, list[Detection]] = defaultdict(list)
+    for finding in findings:
+        by_host[finding.host].append(finding)
+
+    window = timedelta(seconds=ATTACK_CHAIN_WINDOW_SECONDS)
+    chain_severity: str | None = None
+    for host_findings in by_host.values():
+        host_findings.sort(key=lambda finding: finding.timestamp)
+        start = 0
+        for end, finding in enumerate(host_findings):
+            while finding.timestamp - host_findings[start].timestamp > window:
+                start += 1
+            current = host_findings[start : end + 1]
+            techniques = {item.technique_id for item in current}
+            if "T1486" in techniques and len(techniques) >= 4 and any(item.rule_id == "RANSOM-006" for item in current):
+                return "critical"
+            if len(techniques) >= 3:
+                chain_severity = "high"
+    return chain_severity
+
+
+def _same_file_path(first: Path, second: Path) -> bool:
+    if first.resolve() == second.resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def recommended_actions(incident: Incident) -> tuple[str, ...]:
@@ -349,8 +406,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     content = render_json(incident) if args.format == "json" else render_report(incident, args.input.name)
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(content, encoding="utf-8")
+        if _same_file_path(args.input, args.output):
+            print("Error: --output must not refer to the input telemetry file")
+            return 2
+        try:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            _write_atomic(args.output, content)
+        except OSError as exc:
+            print(f"Error: could not write {args.output}: {exc}")
+            return 2
     else:
         print(content)
     return 1 if args.fail_on_incident and incident.severity in {"high", "critical"} else 0
