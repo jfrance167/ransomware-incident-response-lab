@@ -2,6 +2,19 @@
 
 This defensive-security lab detects and correlates a modeled ransomware attack chain using sanitized, synthetic Windows telemetry. It does not contain malware, execute commands from the telemetry, connect to endpoints, or modify system files.
 
+## Synthetic terminal example
+
+Run the included ransomware scenario, which consists of inert JSONL telemetry. This excerpt shows the actual CLI summary with host identifiers omitted.
+
+```text
+$ python ransomware_ir.py samples/ransomware-attack.jsonl
+# Ransomware Incident Analysis
+Incident severity: **CRITICAL**
+Analytic confidence: **HIGH**
+Detections: **7**
+Affected hosts: **[synthetic hosts omitted]**
+```
+
 ## Detection coverage
 
 | Rule | Behavior | MITRE ATT&CK |
