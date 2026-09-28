@@ -2,7 +2,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ransomware_ir import (
@@ -43,6 +43,41 @@ class RansomwareIRTests(unittest.TestCase):
     def test_attack_dataset_maps_expected_techniques(self):
         techniques = set(analyze(load_events(ATTACK)).techniques)
         self.assertEqual(techniques, {"T1003.001", "T1021.002", "T1059.001", "T1070.001", "T1486", "T1490"})
+
+    def test_findings_on_different_hosts_do_not_form_high_severity_chain(self):
+        timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        events = [
+            Event(timestamp, 1, "HOST-1", "U", "process_create", {"process_name": "powershell.exe", "command_line": "powershell -EncodedCommand SAFE"}),
+            Event(timestamp, 2, "HOST-2", "U", "process_access", {"process_name": "agent.exe", "target_image": "lsass.exe", "granted_access": "0x1010"}),
+            Event(timestamp, 3, "HOST-3", "U", "process_create", {"process_name": "vssadmin.exe", "command_line": "vssadmin delete shadows /all"}),
+            Event(timestamp, 4, "HOST-4", "U", "log_cleared", {}),
+        ]
+        events.extend(
+            Event(timestamp + timedelta(seconds=index), 11, "HOST-5", "U", "file_write", {"target_path": f"C:\\Data\\file{index}.locked"})
+            for index in range(5)
+        )
+
+        incident = analyze(events)
+
+        self.assertEqual(incident.severity, "medium")
+        self.assertEqual(len(incident.affected_hosts), 5)
+
+    def test_findings_outside_chain_window_do_not_form_high_severity_chain(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        events = [
+            Event(start, 1, "HOST-1", "U", "process_create", {"process_name": "powershell.exe", "command_line": "powershell -EncodedCommand SAFE"}),
+            Event(start + timedelta(minutes=20), 2, "HOST-1", "U", "process_access", {"process_name": "agent.exe", "target_image": "lsass.exe", "granted_access": "0x1010"}),
+            Event(start + timedelta(minutes=40), 3, "HOST-1", "U", "process_create", {"process_name": "vssadmin.exe", "command_line": "vssadmin delete shadows /all"}),
+            Event(start + timedelta(minutes=60), 4, "HOST-1", "U", "log_cleared", {}),
+        ]
+        events.extend(
+            Event(start + timedelta(minutes=80, seconds=index), 11, "HOST-1", "U", "file_write", {"target_path": f"C:\\Data\\file{index}.locked"})
+            for index in range(5)
+        )
+
+        incident = analyze(events)
+
+        self.assertEqual(incident.severity, "medium")
 
     def test_benign_control_has_no_findings(self):
         incident = analyze(load_events(BENIGN))
@@ -142,6 +177,35 @@ class RansomwareIRTests(unittest.TestCase):
     def test_cli_attack_fails_with_fail_gate(self):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(main([str(ATTACK), "--fail-on-incident"]), 1)
+
+    def test_cli_rejects_output_that_is_input_file(self):
+        telemetry = ROOT / "tests" / "_cli_collision_input.jsonl"
+        self.addCleanup(telemetry.unlink, missing_ok=True)
+        telemetry.write_text(BENIGN.read_text(encoding="utf-8"), encoding="utf-8")
+        original = telemetry.read_bytes()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main([str(telemetry), "--output", str(telemetry)])
+
+        self.assertEqual(result, 2)
+        self.assertIn("must not refer to the input", output.getvalue())
+        self.assertEqual(telemetry.read_bytes(), original)
+
+    def test_cli_writes_report_to_separate_output_file(self):
+        telemetry = ROOT / "tests" / "_cli_output_input.jsonl"
+        output_dir = ROOT / "tests" / "_cli_output_dir"
+        report = output_dir / "report.json"
+        self.addCleanup(output_dir.rmdir)
+        self.addCleanup(report.unlink, missing_ok=True)
+        self.addCleanup(telemetry.unlink, missing_ok=True)
+        telemetry.write_text(BENIGN.read_text(encoding="utf-8"), encoding="utf-8")
+        original = telemetry.read_bytes()
+
+        result = main([str(telemetry), "--format", "json", "--output", str(report)])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["severity"], "informational")
+        self.assertEqual(telemetry.read_bytes(), original)
 
 
 if __name__ == "__main__":
