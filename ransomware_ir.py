@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
