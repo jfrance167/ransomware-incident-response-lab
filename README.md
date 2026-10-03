@@ -39,6 +39,10 @@ python -m unittest discover -s tests -v
 
 Use `--format json` for machine-readable output. With `--fail-on-incident`, the program returns exit status 1 only for high or critical correlated incidents.
 
+Telemetry input is capped at 100 MiB total, 1 MiB per JSONL line, and 100,000
+events. Markdown report fields are escaped and web, FTP, and email URL schemes
+are defanged; JSON output retains the original parsed values.
+
 ## Evidence
 
 - [`LAB_REPORT.md`](LAB_REPORT.md) records the hypothesis, procedure, measured results, limitations, and conclusion.
@@ -49,3 +53,21 @@ Use `--format json` for machine-readable output. With `--fail-on-incident`, the 
 ## Safety and scope
 
 All commands, paths, hosts, users, addresses, and artifacts in `samples/` are inert data created for this lab. Documentation-reserved IP space and fictional identities are used. The analyzer only parses local JSONL and never passes telemetry fields to a shell or process launcher.
+
+## Repository map
+
+```text
+ransomware-incident-response-lab/
+|-- .github/
+|-- .gitignore
+|-- INCIDENT_RESPONSE_PLAYBOOK.md
+|-- LAB_REPORT.md
+|-- README.md
+|-- SECURITY.md
+|-- ransomware_ir.py
+|-- reports/
+|-- samples/
+`-- tests/
+```
+
+Follow the setup and safety boundaries above before running or deploying any code.

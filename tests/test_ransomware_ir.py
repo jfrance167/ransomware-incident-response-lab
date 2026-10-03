@@ -1,9 +1,11 @@
 import io
 import json
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from ransomware_ir import (
     Detection,
@@ -20,6 +22,7 @@ from ransomware_ir import (
     main,
     parse_event,
     recommended_actions,
+    render_json,
     render_report,
 )
 
@@ -138,6 +141,47 @@ class RansomwareIRTests(unittest.TestCase):
         )
         self.assertEqual(detect_file_bursts(events), ())
 
+    def test_file_burst_window_expires_paths_and_reports_first_threshold(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        events = (
+            Event(start, 1, "HOST-1", "SYSTEM", "file_write", {"target_path": "C:\\a.locked"}),
+            Event(start + timedelta(seconds=60), 2, "HOST-1", "SYSTEM", "file_write", {"target_path": "C:\\b.locked"}),
+            Event(start + timedelta(seconds=61), 3, "HOST-1", "SYSTEM", "file_write", {"target_path": "C:\\c.locked"}),
+            Event(start + timedelta(seconds=62), 4, "HOST-1", "SYSTEM", "file_write", {"target_path": "C:\\d.locked"}),
+            Event(start + timedelta(seconds=63), 5, "HOST-1", "SYSTEM", "file_write", {"target_path": "C:\\e.locked"}),
+        )
+
+        detection = detect_file_bursts(events, threshold=4)[0]
+
+        self.assertEqual(detection.timestamp, events[-1].timestamp)
+        self.assertIn("unique_files=4", detection.evidence)
+        at_boundary = detect_file_bursts(events[:2], threshold=2)[0]
+        self.assertEqual(at_boundary.timestamp, events[1].timestamp)
+
+    def test_jsonl_input_limits_are_enforced(self):
+        path = Path(__file__).parent / "_bounded.jsonl"
+        record = {"timestamp": "2026-01-01T00:00:00Z", "event_id": 1, "host": "H", "user": "U", "event_type": "x", "details": {}}
+        row = json.dumps(record) + "\n"
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        path.write_text(row, encoding="utf-8")
+        with patch("ransomware_ir.MAX_INPUT_BYTES", len(row.encode("utf-8")) - 1):
+            with self.assertRaisesRegex(TelemetryError, "input exceeds"):
+                load_events(path)
+        with patch("ransomware_ir.Path.stat", return_value=SimpleNamespace(st_size=0)):
+            with patch("ransomware_ir.MAX_INPUT_BYTES", len(row.encode("utf-8")) - 1):
+                with self.assertRaisesRegex(TelemetryError, "input exceeds"):
+                    load_events(path)
+
+        path.write_text(row + row, encoding="utf-8")
+        with patch("ransomware_ir.MAX_EVENTS", 1):
+            with self.assertRaisesRegex(TelemetryError, "events"):
+                load_events(path)
+
+        with patch("ransomware_ir.MAX_JSONL_LINE_BYTES", 8):
+            with self.assertRaisesRegex(TelemetryError, "exceeds"):
+                load_events(path)
+
     def test_parse_rejects_timestamp_without_timezone(self):
         record = {"timestamp": "2026-01-01T00:00:00", "event_id": 1, "host": "H", "user": "U", "event_type": "x", "details": {}}
         with self.assertRaises(TelemetryError):
@@ -160,11 +204,21 @@ class RansomwareIRTests(unittest.TestCase):
         self.assertLess(loaded[0].timestamp, loaded[1].timestamp)
 
     def test_report_escapes_untrusted_cells(self):
-        finding = Detection("TEST", "Title", "high", "Impact", "T0000", "bad|host\nnext", datetime(2026, 1, 1, tzinfo=timezone.utc), "summary", "evidence")
+        hostile = "<svg onload=x>|bad\nhost https://evil.example/path"
+        finding = Detection("TEST", "Title", "high", "Impact", "T0000", hostile, datetime(2026, 1, 1, tzinfo=timezone.utc), "summary", "<img src=x> https://evidence.example/path")
         incident = analyze(())
         incident = incident.__class__("high", "low", (finding,), (finding.host,), (finding.technique_id,))
-        report = render_report(incident, "fixture.jsonl")
-        self.assertIn("bad\\|host next", report)
+        report = render_report(incident, "<sample>.jsonl https://source.example/path")
+        self.assertIn("&lt;svg onload=x&gt;\\|bad host", report)
+        self.assertIn("&lt;img src=x&gt;", report)
+        self.assertIn("hxxps://evil", report)
+        self.assertIn("hxxps://source", report)
+        self.assertNotIn("https://evil.example/path", report)
+        self.assertNotIn("<svg", report)
+        self.assertNotIn("<img", report)
+        json_report = render_json(incident)
+        self.assertIn("<svg onload=x>|bad\\nhost", json_report)
+        self.assertIn("https://evil.example/path", json_report)
 
     def test_response_includes_credential_action(self):
         incident = analyze(load_events(ATTACK))
