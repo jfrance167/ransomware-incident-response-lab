@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import tempfile
-from collections import defaultdict
+import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
@@ -20,6 +22,10 @@ ATTACK_CHAIN_WINDOW_SECONDS = 15 * 60
 ENCRYPTED_EXTENSIONS = {".encrypted", ".locked", ".crypt", ".enc"}
 RANSOM_NOTE_NAMES = {"readme_restore.txt", "recover_files.txt", "how_to_decrypt.txt"}
 SUSPICIOUS_LSASS_ACCESS = {"0x1010", "0x1410", "0x143a", "0x1fffff"}
+MAX_INPUT_BYTES = 100 * 1024 * 1024
+MAX_JSONL_LINE_BYTES = 1024 * 1024
+MAX_EVENTS = 100_000
+_URL_SCHEME_RE = re.compile(r"(?i)\b(https?|ftps?|mailto):")
 
 
 class TelemetryError(ValueError):
@@ -92,19 +98,37 @@ def parse_event(record: object, line_number: int) -> Event:
 
 
 def load_events(path: Path) -> tuple[Event, ...]:
+    events: list[Event] = []
+    total_bytes = 0
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        if path.stat().st_size > MAX_INPUT_BYTES:
+            raise TelemetryError(f"input exceeds {MAX_INPUT_BYTES} bytes")
+        with path.open("rb") as stream:
+            line_number = 0
+            while raw_line := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+                line_number += 1
+                total_bytes += len(raw_line)
+                if total_bytes > MAX_INPUT_BYTES:
+                    raise TelemetryError(f"input exceeds {MAX_INPUT_BYTES} bytes")
+                if len(raw_line) > MAX_JSONL_LINE_BYTES:
+                    raise TelemetryError(
+                        f"line {line_number}: exceeds {MAX_JSONL_LINE_BYTES} bytes"
+                    )
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise TelemetryError(f"line {line_number}: invalid UTF-8") from exc
+                if not line.strip():
+                    continue
+                if len(events) >= MAX_EVENTS:
+                    raise TelemetryError(f"input exceeds {MAX_EVENTS} events")
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise TelemetryError(f"line {line_number}: invalid JSON") from exc
+                events.append(parse_event(record, line_number))
     except OSError as exc:
         raise TelemetryError(f"could not read {path}: {exc}") from exc
-    events: list[Event] = []
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise TelemetryError(f"line {line_number}: invalid JSON") from exc
-        events.append(parse_event(record, line_number))
     return tuple(sorted(events, key=lambda event: (event.timestamp, event.host, event.event_id)))
 
 
@@ -211,14 +235,19 @@ def detect_file_bursts(events: Sequence[Event], threshold: int = 5, window_secon
     window = timedelta(seconds=window_seconds)
     for host, writes in by_host.items():
         start = 0
+        paths: Counter[str] = Counter()
         for end, event in enumerate(writes):
             while event.timestamp - writes[start].timestamp > window:
+                expired_path = _detail(writes[start], "target_path").lower()
+                paths[expired_path] -= 1
+                if paths[expired_path] == 0:
+                    del paths[expired_path]
                 start += 1
-            current = writes[start : end + 1]
-            unique_paths = {_detail(item, "target_path").lower() for item in current}
-            if len(unique_paths) >= threshold:
+            current_path = _detail(event, "target_path").lower()
+            paths[current_path] += 1
+            if len(paths) >= threshold:
                 detections.append(
-                    _detection(event, "RANSOM-006", "Rapid encrypted-file modification burst", "critical", "Impact", "T1486", f"At least {threshold} files gained encryption-associated extensions within {window_seconds} seconds.", f"unique_files={len(unique_paths)}; window_seconds={window_seconds}")
+                    _detection(event, "RANSOM-006", "Rapid encrypted-file modification burst", "critical", "Impact", "T1486", f"At least {threshold} files gained encryption-associated extensions within {window_seconds} seconds.", f"unique_files={len(paths)}; window_seconds={window_seconds}")
                 )
                 break
     return tuple(detections)
@@ -260,12 +289,21 @@ def _has_correlated_attack_chain(findings: Sequence[Detection]) -> str | None:
     for host_findings in by_host.values():
         host_findings.sort(key=lambda finding: finding.timestamp)
         start = 0
+        techniques: Counter[str] = Counter()
+        file_burst_count = 0
         for end, finding in enumerate(host_findings):
             while finding.timestamp - host_findings[start].timestamp > window:
+                expired = host_findings[start]
+                techniques[expired.technique_id] -= 1
+                if techniques[expired.technique_id] == 0:
+                    del techniques[expired.technique_id]
+                if expired.rule_id == "RANSOM-006":
+                    file_burst_count -= 1
                 start += 1
-            current = host_findings[start : end + 1]
-            techniques = {item.technique_id for item in current}
-            if "T1486" in techniques and len(techniques) >= 4 and any(item.rule_id == "RANSOM-006" for item in current):
+            techniques[finding.technique_id] += 1
+            if finding.rule_id == "RANSOM-006":
+                file_burst_count += 1
+            if "T1486" in techniques and len(techniques) >= 4 and file_burst_count:
                 return "critical"
             if len(techniques) >= 3:
                 chain_severity = "high"
@@ -319,8 +357,28 @@ def recommended_actions(incident: Incident) -> tuple[str, ...]:
     return tuple(actions)
 
 
-def _cell(value: object) -> str:
-    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+def _markdown_text(value: object) -> str:
+    """Render untrusted telemetry as inert Markdown text with controls flattened."""
+    normalized = "".join(
+        " "
+        if unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+        else character
+        for character in str(value)
+    )
+    normalized = _URL_SCHEME_RE.sub(
+        lambda match: {
+            "http": "hxxp",
+            "https": "hxxps",
+            "ftp": "fxp",
+            "ftps": "fxps",
+            "mailto": "mail[to]",
+        }[match.group(1).lower()] + ":",
+        normalized,
+    )
+    escaped = html.escape(normalized, quote=True)
+    for character in "\\`*_{}[]()#+-.!|>":
+        escaped = escaped.replace(character, "\\" + character)
+    return escaped
 
 
 def render_report(incident: Incident, source_name: str) -> str:
@@ -329,12 +387,12 @@ def render_report(incident: Incident, source_name: str) -> str:
         "",
         "> Educational analysis of sanitized, synthetic telemetry. No malware or destructive command was executed.",
         "",
-        f"Source: `{source_name}`",
+        f"Source: {_markdown_text(source_name)}",
         "",
         f"Incident severity: **{incident.severity.upper()}**",
         f"Analytic confidence: **{incident.confidence.upper()}**",
         f"Detections: **{len(incident.findings)}**",
-        f"Affected hosts: **{', '.join(incident.affected_hosts) if incident.affected_hosts else 'None'}**",
+        f"Affected hosts: **{', '.join(_markdown_text(host) for host in incident.affected_hosts) if incident.affected_hosts else 'None'}**",
         "",
         "## Executive assessment",
         "",
@@ -357,10 +415,10 @@ def render_report(incident: Incident, source_name: str) -> str:
             finding.technique_id,
             finding.evidence,
         )
-        lines.append("| " + " | ".join(_cell(value) for value in row) + " |")
+        lines.append("| " + " | ".join(_markdown_text(value) for value in row) + " |")
     lines.extend(["", "## MITRE ATT&CK coverage", ""])
     if incident.techniques:
-        lines.extend(f"- `{technique}`" for technique in incident.techniques)
+        lines.extend(f"- {_markdown_text(technique)}" for technique in incident.techniques)
     else:
         lines.append("- No techniques detected")
     lines.extend(["", "## Recommended response", ""])
