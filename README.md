@@ -2,6 +2,26 @@
 
 This defensive-security lab detects and correlates a modeled ransomware attack chain using sanitized, synthetic Windows telemetry. It does not contain malware, execute commands from the telemetry, connect to endpoints, or modify system files.
 
+## Project overview
+
+| Focus | Evidence | Scope |
+| --- | --- | --- |
+| Correlate a modeled ransomware chain and compare a benign control | [Lab results](LAB_REPORT.md) · [Incident report](reports/ransomware-incident-report.md) · [Benign control](reports/benign-control-report.md) | Inert synthetic telemetry; no malware execution or endpoint containment |
+
+### Workflow
+
+```mermaid
+flowchart LR
+    A["Synthetic attack telemetry"] --> V["Validate JSONL events"]
+    B["Benign control telemetry"] --> V
+    V --> D["Seven deterministic detection rules"]
+    D --> C["Correlate impact and techniques"]
+    C --> R["Severity, timeline, and response report"]
+    R --> H["Human investigation"]
+```
+
+The recorded experiment produced seven attack findings and zero benign-control findings. See the lab report for the controlled data and interpretation limits.
+
 ## Synthetic terminal example
 
 Run the included ransomware scenario, which consists of inert JSONL telemetry. This excerpt shows the actual CLI summary with host identifiers omitted.
@@ -71,3 +91,4 @@ ransomware-incident-response-lab/
 ```
 
 Follow the setup and safety boundaries above before running or deploying any code.
+
